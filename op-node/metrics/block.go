@@ -22,8 +22,9 @@ type BlockMetrics struct {
 
 	GasUsed prometheus.Histogram
 
-	TransactionSize        *prometheus.HistogramVec
-	TransactionCallData    *prometheus.HistogramVec
+	TransactionSize        prometheus.Histogram
+	TransactionCallDataSum *prometheus.CounterVec
+	TransactionCount       *prometheus.CounterVec
 	TransactionNonce       prometheus.Histogram
 	TransactionGasLimit    prometheus.Histogram
 	TransactionType        *prometheus.CounterVec
@@ -34,7 +35,19 @@ type BlockMetrics struct {
 	BaseFeeGauge prometheus.Gauge
 }
 
-var goerliBaseInbox = common.HexToAddress("0x8453100000000000000000000000000000000000")
+// batch inboxes of several rollups, to tag for metrics
+var txTags = map[common.Address]string{
+	chaincfg.Goerli.BatchInboxAddress:                                 "goerli op",
+	common.HexToAddress("0x8453100000000000000000000000000000000000"): "goerli base",
+	common.HexToAddress("0xa997cfD539E703921fD1e3Cf25b4c241a27a4c7A"): "goerli polygon zkevm v2",
+	common.HexToAddress("0xB949b4E3945628650862a29Abef3291F2eD52471"): "goerli zksync era",
+	common.HexToAddress("0x3C584eC7f0f2764CC715ac3180Ae9828465E9833"): "goerli scroll alpha",
+	common.HexToAddress("0xd55c5977c811e1856519d46C04E49774eD9695f0"): "goerli arb nitro 1",
+	common.HexToAddress("0x0484A87B144745A2E5b7c359552119B6EA2917A9"): "goerli arb nitro 2",
+	common.HexToAddress("0x6BEbC4925716945D46F0Ec336D5C2564F419682C"): "goerli arb nitro 3",
+	common.HexToAddress("0xFf00000000000000000000000000000000000421"): "goerli op nightly",
+	common.HexToAddress("0xff00000000000000000000000000000000000888"): "goerli op chaos",
+}
 
 const (
 	l1InfoTx           = "l1_info"
@@ -73,20 +86,26 @@ func NewBlockMetrics(factory metrics.Factory, ns string, subsystem string, displ
 			Help:      displayName + " total gas used in block",
 		}),
 
-		TransactionSize: factory.NewHistogramVec(prometheus.HistogramOpts{
+		TransactionSize: factory.NewHistogram(prometheus.HistogramOpts{
 			Namespace: ns,
 			Subsystem: subsystem,
 			Name:      "transaction_size",
 			Help:      displayName + " transaction size in bytes, tagged if recognized",
 			Buckets:   sizeBuckets,
-		}, []string{"tx_tag"}),
+		}),
 
-		TransactionCallData: factory.NewHistogramVec(prometheus.HistogramOpts{
+		TransactionCallDataSum: factory.NewCounterVec(prometheus.CounterOpts{
 			Namespace: ns,
 			Subsystem: subsystem,
-			Name:      "transaction_call_data",
-			Help:      displayName + " transaction call data length in bytes, tagged if recognized",
-			Buckets:   sizeBuckets,
+			Name:      "transaction_call_data_sum",
+			Help:      displayName + " transaction total call data length in bytes, tagged if recognized",
+		}, []string{"tx_tag"}),
+
+		TransactionCount: factory.NewCounterVec(prometheus.CounterOpts{
+			Namespace: ns,
+			Subsystem: subsystem,
+			Name:      "transaction_count",
+			Help:      displayName + " transaction total count, tagged if recognized",
 		}, []string{"tx_tag"}),
 
 		TransactionNonce: factory.NewHistogram(prometheus.HistogramOpts{
@@ -152,19 +171,21 @@ func (bm *BlockMetrics) record(gasUsed uint64, baseFee *big.Int, txs types.Trans
 				txTag = userDepositTx
 			}
 		} else if tx.To() != nil {
-			switch *tx.To() {
-			case chaincfg.Goerli.BatchInboxAddress:
-				txTag = "op-inbox"
-			case goerliBaseInbox:
-				txTag = "base-inbox"
-				// More chains (even non op-stack addresses) may be tagged here,
-				// if they have a big impact on data availability.
+			to := *tx.To()
+			tag, ok := txTags[to]
+			if ok {
+				txTag = tag
+			} else if len(tx.Data()) > 128_000 { // keep track of abnormal cases
+				txTag = "abnormal"
+			} else if len(tx.Data()) > 64_000 { // and high usage
+				txTag = "high"
 			}
 		} else {
 			txTag = contractDeployment
 		}
-		bm.TransactionSize.WithLabelValues(txTag).Observe(float64(size))
-		bm.TransactionCallData.WithLabelValues(txTag).Observe(float64(len(tx.Data())))
+		bm.TransactionSize.Observe(float64(size))
+		bm.TransactionCallDataSum.WithLabelValues(txTag).Add(float64(len(tx.Data())))
+		bm.TransactionCount.WithLabelValues(txTag).Inc()
 		bm.TransactionNonce.Observe(float64(tx.Nonce()))
 		bm.TransactionType.WithLabelValues(strconv.Itoa(int(tx.Type()))).Inc()
 
